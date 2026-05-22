@@ -1,4 +1,5 @@
 import asyncio
+import json
 from typing import AsyncGenerator
 
 from fastapi import APIRouter, Query
@@ -9,7 +10,7 @@ from app.utils.sse import sse_event
 from app.services.stock_data import fetch_stock_data
 from app.services.indicators import compute_indicators
 from app.services.news_analyzer import analyze_all_sources
-from app.services.criteria import custom_criteria
+from app.services.criteria import custom_criteria, AVAILABLE_CRITERIA
 from app.services.ai_engine import train_ai_engine
 from app.services.trade_levels import compute_trade_levels
 from app.services.explanation import ai_explanation_engine
@@ -23,6 +24,8 @@ async def run_analysis(
     timeframe: str,
     interval: str,
     websites: list[str],
+    criteria_config: dict | None = None,
+    model: str = "",
 ) -> AsyncGenerator[str, None]:
     """
     Generator that yields one SSE event per step.
@@ -49,7 +52,9 @@ async def run_analysis(
 
         # Step 2 — Custom criteria / rule-based signals
         yield sse_event(2, "running", "Running custom criteria engine")
-        criteria_signals, criteria_summary = await asyncio.to_thread(custom_criteria, df)
+        criteria_signals, criteria_summary = await asyncio.to_thread(
+            custom_criteria, df, criteria_config
+        )
         state["criteria_signals"] = criteria_signals
         yield sse_event(2, "done", "Running custom criteria engine", criteria_summary)
 
@@ -96,13 +101,15 @@ async def run_analysis(
         yield sse_event(5, "done", "Scanning custom websites", sentiment_summary)
 
         # Step 6 — AI explanation engine
-        yield sse_event(6, "running", "Generating AI explanation")
+        ai_model = model or OPENROUTER_MODEL
+        yield sse_event(6, "running", f"Generating AI explanation ({ai_model})")
         explanation_result = await asyncio.to_thread(
             ai_explanation_engine,
             symbol, sector, df, ai_signal, ai_confidence, ai_proba,
             criteria_signals, sentiment_score, sentiment_label,
-            trade_levels, raw_sentiment, OPENROUTER_API_KEY, OPENROUTER_MODEL,
+            trade_levels, raw_sentiment, OPENROUTER_API_KEY, ai_model,
         )
+        explanation_result["model_used"] = ai_model
         yield sse_event(6, "done", "Generating AI explanation", explanation_result)
 
         # Final — send complete event with full summary
@@ -139,20 +146,43 @@ async def analyze(
     timeframe: str = Query("1y", description="yfinance period: 1mo 3mo 6mo 1y 3y 5y"),
     interval: str = Query("1d", description="yfinance interval: 1d 1wk 1mo"),
     websites: str = Query("", description="Comma-separated domain list"),
+    criteria: str = Query("", description='JSON criteria config, e.g. {"RSI":{"enabled":true,"oversold":25},"MACD":{"enabled":false}}'),
+    model: str = Query("", description="OpenRouter model name, e.g. nvidia/nemotron-3-super-120b-a12b:free"),
 ):
     """
     Stream multi-step stock analysis as Server-Sent Events.
 
     Each SSE message is JSON:
         { step, status: "running"|"done"|"error"|"complete", title, data }
+
+    Parameters:
+        - criteria: JSON to select/configure indicators (RSI, MACD, SMA50, EMA_Cross, Bollinger, Volume)
+        - model: OpenRouter model name for AI explanation (defaults to env OPENROUTER_MODEL)
     """
     site_list = [s.strip() for s in websites.split(",") if s.strip()][:MAX_CUSTOM_WEBSITES]
 
+    criteria_config = None
+    if criteria:
+        try:
+            criteria_config = json.loads(criteria)
+        except json.JSONDecodeError:
+            pass
+
     return StreamingResponse(
-        run_analysis(symbol, sector, timeframe, interval, site_list),
+        run_analysis(symbol, sector, timeframe, interval, site_list, criteria_config, model),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.get("/criteria")
+async def list_criteria():
+    """List all available criteria and their default configuration."""
+    from app.services.criteria import DEFAULT_CRITERIA_CONFIG
+    return {
+        "available_criteria": AVAILABLE_CRITERIA,
+        "defaults": DEFAULT_CRITERIA_CONFIG,
+    }
