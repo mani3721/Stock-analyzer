@@ -6,9 +6,9 @@ services:
     buildCommand: pip install -r requirements.txt && python -m textblob.download_corpora
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
       - key: OPENROUTER_API_KEY
         sync: false
       - key: OPENROUTER_MODEL
         value: nvidia/nemotron-3-super-120b-a12b:free
-      - key: PYTHON_VERSION
-        value: 3.11.9
