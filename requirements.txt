@@ -7,6 +7,5 @@ pandas-ta>=0.4.67b0
 numpy
 scikit-learn
 requests
-beautifulsoup4
 textblob
 python-dotenv
