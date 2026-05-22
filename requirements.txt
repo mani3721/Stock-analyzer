@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+gunicorn
+yfinance
+pandas>=2.2.0
+pandas-ta
+numpy
+scikit-learn
+requests
+beautifulsoup4
+textblob
+python-dotenv
