@@ -186,3 +186,92 @@ async def list_criteria():
         "available_criteria": AVAILABLE_CRITERIA,
         "defaults": DEFAULT_CRITERIA_CONFIG,
     }
+
+
+async def run_batch_analysis(
+    symbols: list[str],
+    sector: str,
+    timeframe: str,
+    interval: str,
+    websites: list[str],
+    criteria_config: dict | None = None,
+    model: str = "",
+) -> AsyncGenerator[str, None]:
+    """Run analysis for multiple symbols in parallel, multiplexing all SSE events
+    into a single stream. Each event includes a 'symbol' field so the frontend
+    can route it to the correct stock panel."""
+
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    pending = len(symbols)
+
+    async def _run_one(sym: str) -> None:
+        nonlocal pending
+        try:
+            async for event in run_analysis(sym, sector, timeframe, interval, websites, criteria_config, model):
+                import json as _json
+                # Inject symbol into each SSE payload
+                raw = event.removeprefix("data: ").strip()
+                try:
+                    payload = _json.loads(raw)
+                    payload["symbol"] = sym
+                    await queue.put(f"data: {_json.dumps(payload)}\n\n")
+                except Exception:
+                    await queue.put(event)
+        finally:
+            pending_now = pending - 1
+            # Use a mutable cell via closure; safe because asyncio is single-threaded
+            object.__setattr__(run_batch_analysis, "__pending__", pending_now)
+            await queue.put(None)  # sentinel for this symbol
+
+    tasks = [asyncio.create_task(_run_one(sym)) for sym in symbols]
+
+    finished = 0
+    while finished < len(symbols):
+        item = await queue.get()
+        if item is None:
+            finished += 1
+        else:
+            yield item
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@router.get("/analyze/batch")
+async def analyze_batch(
+    symbols: str = Query(..., description="Comma-separated Yahoo Finance tickers, e.g. RELIANCE.NS,TCS.NS,INFY.NS"),
+    sector: str = Query("", description="Sector label applied to all symbols"),
+    timeframe: str = Query("1y", description="yfinance period: 1mo 3mo 6mo 1y 3y 5y"),
+    interval: str = Query("1d", description="yfinance interval: 1d 1wk 1mo"),
+    websites: str = Query("", description="Comma-separated domain list"),
+    criteria: str = Query("", description="JSON criteria config"),
+    model: str = Query("", description="OpenRouter model name"),
+    max_symbols: int = Query(10, description="Safety cap on number of symbols (max 20)"),
+):
+    """
+    Stream parallel analysis for multiple NSE stocks as Server-Sent Events.
+
+    Each SSE message includes a 'symbol' field so the frontend can route
+    events to the correct stock panel. All stocks are analyzed concurrently.
+
+    Example: GET /analyze/batch?symbols=RELIANCE.NS,TCS.NS,HDFCBANK.NS
+    """
+    symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
+    symbol_list = symbol_list[:min(max_symbols, 20)]
+
+    site_list = [s.strip() for s in websites.split(",") if s.strip()][:MAX_CUSTOM_WEBSITES]
+
+    criteria_config = None
+    if criteria:
+        try:
+            criteria_config = json.loads(criteria)
+        except json.JSONDecodeError:
+            pass
+
+    return StreamingResponse(
+        run_batch_analysis(symbol_list, sector, timeframe, interval, site_list, criteria_config, model),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
