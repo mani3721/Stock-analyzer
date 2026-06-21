@@ -6,26 +6,30 @@ from fastapi import APIRouter, Query
 from fastapi.responses import StreamingResponse
 
 from app.config import OPENROUTER_API_KEY, OPENROUTER_MODEL, MAX_CUSTOM_WEBSITES
-from app.utils.sse import sse_event
+from app.utils.sse import sse_event, SSE_STREAM_INIT, SSE_STREAM_CLOSE
 from app.services.stock_data import fetch_stock_data
 from app.services.indicators import compute_indicators
 from app.services.news_analyzer import analyze_all_sources
-from app.services.criteria import custom_criteria, AVAILABLE_CRITERIA
+from app.services.criteria import (
+    custom_criteria, AVAILABLE_CRITERIA,
+    evaluate_post_analysis_criteria, evaluate_custom_rules,
+)
 from app.services.ai_engine import train_ai_engine
 from app.services.trade_levels import compute_trade_levels
 from app.services.explanation import ai_explanation_engine
+from app.models.schemas import AnalysisRequest, BatchAnalysisRequest
 
 router = APIRouter()
 
 
 async def run_analysis(
     symbol: str,
-    sector: str,
     timeframe: str,
     interval: str,
     websites: list[str],
     criteria_config: dict | None = None,
     model: str = "",
+    custom_rules: dict | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Generator that yields one SSE event per step.
@@ -33,6 +37,8 @@ async def run_analysis(
     On error: yields "error" and stops the pipeline.
     """
     state: dict = {}
+
+    yield SSE_STREAM_INIT  # disable browser auto-reconnect
 
     try:
         # Step 0 — Fetch stock data
@@ -42,6 +48,8 @@ async def run_analysis(
         )
         state["df"] = df
         state["stock_info"] = stock_info
+        # Extract sector automatically from Yahoo Finance info
+        sector = stock_info.get("sector", stock_info.get("industry", ""))
         yield sse_event(0, "done", "Fetching stock data", price_summary)
 
         # Step 1 — Compute technical indicators
@@ -53,10 +61,17 @@ async def run_analysis(
         # Step 2 — Custom criteria / rule-based signals
         yield sse_event(2, "running", "Running custom criteria engine")
         criteria_signals, criteria_summary = await asyncio.to_thread(
-            custom_criteria, df, criteria_config
+            custom_criteria, df, criteria_config, stock_info
         )
         state["criteria_signals"] = criteria_signals
         yield sse_event(2, "done", "Running custom criteria engine", criteria_summary)
+
+        # Step 2b — AND/OR/NOT custom rules (visual builder)
+        if custom_rules:
+            yield sse_event(2, "running", "Evaluating custom rule tree")
+            custom_rule_result = await asyncio.to_thread(evaluate_custom_rules, df, custom_rules)
+            state["custom_rule_result"] = custom_rule_result
+            yield sse_event(2, "done", "Custom rule evaluation complete", custom_rule_result)
 
         # Step 3 — AI scoring (Random Forest)
         yield sse_event(3, "running", "Training AI scoring model")
@@ -100,14 +115,37 @@ async def run_analysis(
         }
         yield sse_event(5, "done", "Scanning custom websites", sentiment_summary)
 
+        # Step 5b — Post-analysis criteria (NEWS_SENTIMENT, BUY_PROB, SELL_PROB, CONFIDENCE)
+        post_signals = evaluate_post_analysis_criteria(
+            criteria_config,
+            ai_signal, ai_confidence, ai_proba,
+            sentiment_score, sentiment_label,
+        )
+        state["post_signals"] = post_signals
+        if post_signals:
+            # Merge into criteria_signals so the explanation engine sees them
+            for k, v in post_signals.items():
+                criteria_signals[k] = (v["signal"], v["reason"])
+            yield sse_event(
+                5,
+                "done",
+                "Post-analysis criteria evaluated",
+                {
+                    "post_signals": post_signals,
+                    "buy_count": sum(1 for v in post_signals.values() if v["signal"] == "BUY"),
+                    "sell_count": sum(1 for v in post_signals.values() if v["signal"] == "SELL"),
+                    "hold_count": sum(1 for v in post_signals.values() if v["signal"] == "HOLD"),
+                },
+            )
+
         # Step 6 — AI explanation engine
         ai_model = model or OPENROUTER_MODEL
         yield sse_event(6, "running", f"Generating AI explanation ({ai_model})")
         explanation_result = await asyncio.to_thread(
             ai_explanation_engine,
-            symbol, sector, df, ai_signal, ai_confidence, ai_proba,
+            symbol, df, ai_signal, ai_confidence, ai_proba,
             criteria_signals, sentiment_score, sentiment_label,
-            trade_levels, raw_sentiment, OPENROUTER_API_KEY, ai_model,
+            trade_levels, raw_sentiment, OPENROUTER_API_KEY, ai_model, sector,
         )
         explanation_result["model_used"] = ai_model
         yield sse_event(6, "done", "Generating AI explanation", explanation_result)
@@ -130,19 +168,22 @@ async def run_analysis(
                 "label": sentiment_label,
             },
             "criteria": criteria_summary,
+            "custom_rule_result": state.get("custom_rule_result", {}),
+            "post_analysis_signals": state.get("post_signals", {}),
             "indicators": indicators_summary,
             "explanation": explanation_result,
         }
         yield sse_event(7, "complete", "Analysis complete", summary)
+        yield SSE_STREAM_CLOSE  # signals frontend to close EventSource cleanly
 
     except Exception as exc:
         yield sse_event(-1, "error", "Pipeline failed", {"error": str(exc)})
+        yield SSE_STREAM_CLOSE
 
 
 @router.get("/analyze")
 async def analyze(
     symbol: str = Query(..., description="Yahoo Finance ticker, e.g. RELIANCE.NS"),
-    sector: str = Query("", description="Sector label (informational)"),
     timeframe: str = Query("1y", description="yfinance period: 1mo 3mo 6mo 1y 3y 5y"),
     interval: str = Query("1d", description="yfinance interval: 1d 1wk 1mo"),
     websites: str = Query("", description="Comma-separated domain list"),
@@ -169,7 +210,7 @@ async def analyze(
             pass
 
     return StreamingResponse(
-        run_analysis(symbol, sector, timeframe, interval, site_list, criteria_config, model),
+        run_analysis(symbol, timeframe, interval, site_list, criteria_config, model),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -190,38 +231,31 @@ async def list_criteria():
 
 async def run_batch_analysis(
     symbols: list[str],
-    sector: str,
     timeframe: str,
     interval: str,
     websites: list[str],
     criteria_config: dict | None = None,
     model: str = "",
+    custom_rules: dict | None = None,
 ) -> AsyncGenerator[str, None]:
     """Run analysis for multiple symbols in parallel, multiplexing all SSE events
     into a single stream. Each event includes a 'symbol' field so the frontend
     can route it to the correct stock panel."""
 
     queue: asyncio.Queue[str | None] = asyncio.Queue()
-    pending = len(symbols)
 
     async def _run_one(sym: str) -> None:
-        nonlocal pending
         try:
-            async for event in run_analysis(sym, sector, timeframe, interval, websites, criteria_config, model):
-                import json as _json
-                # Inject symbol into each SSE payload
+            async for event in run_analysis(sym, timeframe, interval, websites, criteria_config, model, custom_rules):
                 raw = event.removeprefix("data: ").strip()
                 try:
-                    payload = _json.loads(raw)
+                    payload = json.loads(raw)
                     payload["symbol"] = sym
-                    await queue.put(f"data: {_json.dumps(payload)}\n\n")
+                    await queue.put(f"data: {json.dumps(payload)}\n\n")
                 except Exception:
                     await queue.put(event)
         finally:
-            pending_now = pending - 1
-            # Use a mutable cell via closure; safe because asyncio is single-threaded
-            object.__setattr__(run_batch_analysis, "__pending__", pending_now)
-            await queue.put(None)  # sentinel for this symbol
+            await queue.put(None)  # sentinel: this symbol is done
 
     tasks = [asyncio.create_task(_run_one(sym)) for sym in symbols]
 
@@ -239,7 +273,6 @@ async def run_batch_analysis(
 @router.get("/analyze/batch")
 async def analyze_batch(
     symbols: str = Query(..., description="Comma-separated Yahoo Finance tickers, e.g. RELIANCE.NS,TCS.NS,INFY.NS"),
-    sector: str = Query("", description="Sector label applied to all symbols"),
     timeframe: str = Query("1y", description="yfinance period: 1mo 3mo 6mo 1y 3y 5y"),
     interval: str = Query("1d", description="yfinance interval: 1d 1wk 1mo"),
     websites: str = Query("", description="Comma-separated domain list"),
@@ -268,7 +301,84 @@ async def analyze_batch(
             pass
 
     return StreamingResponse(
-        run_batch_analysis(symbol_list, sector, timeframe, interval, site_list, criteria_config, model),
+        run_batch_analysis(symbol_list, timeframe, interval, site_list, criteria_config, model),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ─── POST endpoints (JSON body — recommended for frontend) ─────────────────────
+
+@router.post("/analyze", summary="Single-symbol analysis via JSON body")
+async def analyze_post(req: AnalysisRequest):
+    """
+    Same as GET /analyze but accepts a clean JSON body instead of query params.
+    Use this from the frontend — avoids URL length limits.
+
+    Stream is Server-Sent Events (text/event-stream).
+    Frontend should use fetch() + ReadableStream (NOT EventSource) for POST.
+
+    Body example:
+        {
+            "symbol": "360ONE.NS",
+            "timeframe": "1y",
+            "interval": "1d",
+            "websites": ["moneycontrol.com", "economictimes.com"],
+            "criteria": {
+                "RSI": {"enabled": true, "oversold": 30},
+                "MACD": {"enabled": true},
+                "Volume": {"enabled": true, "spike_threshold": 1.5}
+            },
+            "model": "nvidia/nemotron-3-super-120b-a12b:free"
+        }
+    """
+    site_list = req.websites[:MAX_CUSTOM_WEBSITES]
+    return StreamingResponse(
+        run_analysis(req.symbol, req.timeframe, req.interval, site_list,
+                     req.criteria, req.model, req.custom_rules),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/analyze/batch", summary="Multi-symbol batch analysis via JSON body")
+async def analyze_batch_post(req: BatchAnalysisRequest):
+    """
+    Same as GET /analyze/batch but accepts a clean JSON body instead of query params.
+    Use this from the frontend — avoids URL length limits.
+
+    Stream is Server-Sent Events (text/event-stream).
+    Frontend should use fetch() + ReadableStream (NOT EventSource) for POST.
+
+    Body example:
+        {
+            "symbols": ["360ONE.NS", "RELIANCE.NS", "TCS.NS"],
+            "timeframe": "1y",
+            "interval": "1d",
+            "websites": ["moneycontrol.com", "economictimes.com", "livemint.com"],
+            "criteria": {
+                "RSI": {"enabled": true, "oversold": 30},
+                "MACD": {"enabled": true},
+                "SMA50": {"enabled": true},
+                "EMA_Cross": {"enabled": true},
+                "Bollinger": {"enabled": true},
+                "Volume": {"enabled": true, "spike_threshold": 1.5}
+            },
+            "model": "nvidia/nemotron-3-super-120b-a12b:free",
+            "max_symbols": 10
+        }
+    """
+    symbol_list = req.symbols[:min(req.max_symbols, 20)]
+    site_list = req.websites[:MAX_CUSTOM_WEBSITES]
+    return StreamingResponse(
+        run_batch_analysis(symbol_list, req.timeframe, req.interval, site_list,
+                           req.criteria, req.model, req.custom_rules),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

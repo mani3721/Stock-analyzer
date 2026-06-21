@@ -7,10 +7,8 @@ import urllib.request
 
 logger = logging.getLogger(__name__)
 
-_URLS = [
-    "https://niftyindices.com/IndexConstituent/ind_nifty200list.csv",
-    "https://niftyindices.com/IndexConstituent/ind_niftymidcap150list.csv",
-]
+# Single Nifty 500 CSV covers large + mid + small cap (~502 stocks)
+_URL = "https://niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
@@ -32,25 +30,30 @@ def _fetch_url_sync(url: str) -> list[str]:
     return [row["Symbol"].strip() for row in reader]
 
 
+_FETCH_TIMEOUT = 20
+
+
 async def _fetch_all() -> list[str]:
     loop = asyncio.get_event_loop()
-    symbols: list[str] = []
-    for url in _URLS:
-        try:
-            batch = await loop.run_in_executor(None, _fetch_url_sync, url)
-            symbols.extend(batch)
-        except Exception as exc:
-            logger.warning("Failed to fetch %s: %s", url, exc)
+    try:
+        symbols = await asyncio.wait_for(
+            loop.run_in_executor(None, _fetch_url_sync, _URL),
+            timeout=_FETCH_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Timeout fetching Nifty 500 list")
+        return []
+    except Exception as exc:
+        logger.warning("Failed to fetch Nifty 500 list: %s", exc)
+        return []
+    return [s + ".NS" for s in dict.fromkeys(symbols)]
 
-    unique = list(dict.fromkeys(symbols))[:250]
-    return [s + ".NS" for s in unique]
 
+async def get_symbols(force_refresh: bool = False) -> list[str]:
+    """Return Nifty 500 NSE symbols as Yahoo Finance tickers (.NS suffix).
 
-async def get_top250(force_refresh: bool = False) -> list[str]:
-    """Return top-250 NSE symbols as Yahoo Finance tickers.
-
-    Results are fetched live from niftyindices.com and cached for 24 hours.
-    Raises RuntimeError if the live fetch fails and no cached data exists.
+    Cached for 7 days (indices rebalance semi-annually).
+    Raises RuntimeError only on cold-start with no cache and failed fetch.
     """
     global _cache, _cache_ts
 
@@ -61,7 +64,7 @@ async def get_top250(force_refresh: bool = False) -> list[str]:
 
         try:
             symbols = await _fetch_all()
-            if len(symbols) < 200:
+            if len(symbols) < 400:
                 raise ValueError(f"Too few symbols returned: {len(symbols)}")
             _cache = symbols
             _cache_ts = time.time()
@@ -75,3 +78,7 @@ async def get_top250(force_refresh: bool = False) -> list[str]:
             logger.warning("Serving stale cache (%d symbols)", len(_cache))
 
         return _cache
+
+
+# backward-compat alias
+get_top250 = get_symbols

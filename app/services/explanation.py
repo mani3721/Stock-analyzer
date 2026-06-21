@@ -42,9 +42,10 @@ def call_openrouter_ai(prompt: str, api_key: str, model: str = "nvidia/nemotron-
 
 
 def build_ai_prompt(
-    symbol: str, sector: str, df, ai_signal: str, ai_confidence: float,
+    symbol: str, df, ai_signal: str, ai_confidence: float,
     ai_proba: list, criteria_signals: dict, sentiment_score: float,
     sentiment_label: str, trade_levels: dict, raw_sentiment_data: list,
+    sector: str = "",
 ) -> str:
     """Build the analysis prompt to send to the AI model."""
     latest = df.iloc[-1]
@@ -176,10 +177,11 @@ Model confidence {ai_confidence:.1f}% — {ai_signal} is the strongest signal ba
 
 
 def ai_explanation_engine(
-    symbol: str, sector: str, df, ai_signal: str, ai_confidence: float,
+    symbol: str, df, ai_signal: str, ai_confidence: float,
     ai_proba: list, criteria_signals: dict, sentiment_score: float,
     sentiment_label: str, trade_levels: dict, raw_sentiment_data: list,
     api_key: str, model: str = "nvidia/nemotron-3-super-120b-a12b:free",
+    sector: str = "",
 ) -> dict:
     """
     Generate AI explanation — tries OpenRouter first, falls back to rule-based.
@@ -191,9 +193,9 @@ def ai_explanation_engine(
 
     if api_key and "PASTE" not in api_key:
         prompt = build_ai_prompt(
-            symbol, sector, df, ai_signal, ai_confidence, ai_proba,
+            symbol, df, ai_signal, ai_confidence, ai_proba,
             criteria_signals, sentiment_score, sentiment_label,
-            trade_levels, raw_sentiment_data,
+            trade_levels, raw_sentiment_data, sector,
         )
         result = call_openrouter_ai(prompt, api_key, model=model)
         if result["success"] and result["content"]:

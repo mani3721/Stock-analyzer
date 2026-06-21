@@ -1,5 +1,13 @@
 import json
 
+# Tell the browser not to auto-reconnect when the stream closes normally.
+SSE_STREAM_INIT = "retry: 0\n\n"
+
+# Terminal event sent after the final "complete" payload.
+# Frontend should listen for event type "close" and call eventSource.close()
+# to prevent the browser firing onerror → "Connection lost".
+SSE_STREAM_CLOSE = "event: close\ndata: {}\n\n"
+
 
 def sse_event(
     step: int,

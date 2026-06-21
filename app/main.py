@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.routes.analysis import router as analysis_router
-from app.services.nse_fetcher import get_top250
+from app.services.nse_fetcher import get_symbols
 
 app = FastAPI(
     title="AI Stock Analysis API",
@@ -25,7 +25,7 @@ app.include_router(analysis_router)
 
 @app.on_event("startup")
 async def _warm_cache():
-    asyncio.create_task(get_top250())
+    asyncio.create_task(get_symbols())
 
 
 @app.get("/health")
@@ -33,17 +33,18 @@ async def health():
     return {"status": "ok", "timestamp": time.time()}
 
 
-@app.get("/top250")
-async def top250_symbols(
+@app.get("/symbols")
+async def symbols_endpoint(
     refresh: bool = Query(False, description="Force a live re-fetch from niftyindices.com"),
 ):
-    """Returns up to 250 NSE stock symbols in Yahoo Finance format (.NS suffix).
+    """Returns Nifty 500 NSE stock symbols (~502) in Yahoo Finance format (.NS suffix).
 
-    Results are fetched live from niftyindices.com and cached for 24 hours.
+    Each entry has a 'label' (e.g. HDFCBANK) and 'value' (e.g. HDFCBANK.NS)
+    ready for use in a frontend dropdown.
     Pass ?refresh=true to force an immediate re-fetch.
     """
     try:
-        symbols = await get_top250(force_refresh=refresh)
+        symbols = await get_symbols(force_refresh=refresh)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     options = [{"label": s.replace(".NS", ""), "value": s} for s in symbols]
